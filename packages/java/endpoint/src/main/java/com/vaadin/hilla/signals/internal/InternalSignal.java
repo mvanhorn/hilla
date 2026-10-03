@@ -113,12 +113,27 @@ public class InternalSignal {
 
     private void notifySubscribers(SignalCommand processedCommand,
             CommandResult result) {
-        var commandToEmit = inProgressCommands
+        // Client submit stores the original JSON. A server-side update, such
+        // as SharedNumberSignal.set, is never stored, so the lookup misses.
+        ObjectNode commandToEmit = inProgressCommands
                 .remove(processedCommand.commandId());
+        if (commandToEmit == null && result.accepted()) {
+            JsonNode serialized = objectMapper.valueToTree(processedCommand);
+            if (serialized instanceof ObjectNode objectNode) {
+                commandToEmit = objectNode;
+            } else {
+                getLogger().debug(
+                        "Processed command {} did not serialize to an object, skipping notification.",
+                        processedCommand.commandId());
+            }
+        }
         if (result.accepted()) {
-            subscribers.entrySet().removeIf(
-                    client -> tryEmitCommandToSubscriber(commandToEmit,
-                            client.getKey(), client.getValue()));
+            if (commandToEmit != null) {
+                ObjectNode toEmit = commandToEmit;
+                subscribers.entrySet()
+                        .removeIf(client -> tryEmitCommandToSubscriber(toEmit,
+                                client.getKey(), client.getValue()));
+            }
         } else {
             // only notify the client that issued the failed command
             String clientSignalId = commandsOfSubscribers
@@ -127,6 +142,13 @@ public class InternalSignal {
                 getLogger().debug(
                         "No client signal id found for command id {}, skipping notification.",
                         processedCommand.commandId());
+                return;
+            }
+            if (commandToEmit == null) {
+                getLogger().debug(
+                        "No in-progress command for rejected command id {}, skipping notification.",
+                        processedCommand.commandId());
+                commandsOfSubscribers.remove(processedCommand.commandId());
                 return;
             }
 
@@ -142,6 +164,9 @@ public class InternalSignal {
 
     private boolean tryEmitCommandToSubscriber(ObjectNode processedCommand,
             String clientSignalId, Sinks.Many<JsonNode> clientSink) {
+        if (processedCommand == null) {
+            return false;
+        }
         boolean failure = clientSink.tryEmitNext(processedCommand).isFailure();
         if (failure) {
             getLogger().debug(
